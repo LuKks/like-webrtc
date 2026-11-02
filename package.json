@@ -1,0 +1,36 @@
+{
+  "name": "like-webrtc",
+  "version": "0.0.0",
+  "description": "Peer-to-peer WebRTC connections with built-in signaling.",
+  "main": "index.js",
+  "scripts": {
+    "test": "standard && brittle-node test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukks/like-webrtc.git"
+  },
+  "author": "Lucas Barrena (LuKks)",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/lukks/like-webrtc/issues"
+  },
+  "homepage": "https://github.com/lukks/like-webrtc#readme",
+  "devDependencies": {
+    "get-npm-global": "^1.0.1"
+  },
+  "dependencies": {
+    "@hyperswarm/secret-stream": "^6.9.2",
+    "@noble/curves": "^1.9.7",
+    "b4a": "^1.8.0",
+    "bs58": "^6.0.0",
+    "compact-encoding": "^3.0.0",
+    "hypercore-crypto": "^3.7.0",
+    "minimist": "^1.2.8",
+    "promise-resolvers": "^1.0.0",
+    "sodium-universal": "^5.0.0",
+    "streamx": "^2.25.0",
+    "webrtc-runtime": "^1.0.0",
+    "ws": "^8.20.0"
+  }
+}
