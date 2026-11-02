@@ -1,6 +1,6 @@
 {
   "name": "like-webrtc",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Peer-to-peer WebRTC connections with built-in signaling.",
   "main": "index.js",
   "scripts": {
