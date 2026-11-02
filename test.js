@@ -1266,6 +1266,85 @@ test('unannounce before listen suppresses automatic announce', async function (t
   await party.close()
 })
 
+test('join retries closed peers until leave', { timeout: 60000 }, async function (t) {
+  t.plan(3)
+
+  const party = new PartyServer()
+  const signaling = await createWebSocketServer(t, function (ws) {
+    party.handle(new RTC.WebSocketDuplex(ws))
+  })
+
+  const a = new RTC({ signaling })
+  const b = new RTC({ signaling })
+
+  t.teardown(async function () {
+    await a.close()
+    await b.close()
+    await party.close()
+  }, { force: true })
+
+  const peers = []
+  const server = a.createServer()
+  const swarm = b.createServer(peer => {
+    peers.push(peer)
+    peer.createDataChannel('idle')
+  })
+  const topic = 'join-retry-until-leave'
+
+  await server.listen()
+  await server.announce(topic)
+  await swarm.join(topic)
+
+  t.is(peers.length, 1, 'join discovers a peer')
+
+  await waitForCondition(() => peers[0].connectionState === 'connected', 10000, 'joined peer to connect')
+  await peers[0].close()
+
+  await waitForCondition(() => peers.length === 2, 10000, 'joined peer to retry after close')
+  t.ok(peers[1] !== peers[0], 'retry creates a new connection')
+
+  await waitForCondition(() => peers[1].connectionState === 'connected', 10000, 'retried peer to connect')
+  await peers[1].close()
+  await swarm.leave(topic)
+  await delay(5000)
+
+  t.is(peers.length, 2, 'leave cancels the pending retry')
+})
+
+test('join backs off failed connections', { timeout: 60000 }, async function (t) {
+  t.plan(3)
+
+  const party = new PartyServer()
+  const signaling = await createWebSocketServer(t, function (ws) {
+    party.handle(new RTC.WebSocketDuplex(ws))
+  })
+
+  const a = new RTC({ signaling })
+  const b = new RTC({ signaling })
+
+  t.teardown(async function () {
+    await a.close()
+    await b.close()
+    await party.close()
+  }, { force: true })
+
+  const attempts = []
+  const server = a.createServer({ firewall: () => false })
+  const swarm = b.createServer(() => attempts.push(Date.now()))
+  const topic = 'join-failed-retry'
+
+  await server.listen()
+  await server.announce(topic)
+  await swarm.join(topic)
+
+  await waitForCondition(() => attempts.length === 4, 45000, 'fourth connection attempt')
+  await swarm.leave(topic)
+
+  t.ok(attempts[1] - attempts[0] >= 1000, 'first retry waits one second')
+  t.ok(attempts[2] - attempts[1] >= 5000, 'second retry waits five seconds')
+  t.ok(attempts[3] - attempts[2] >= 15000, 'third retry waits fifteen seconds')
+})
+
 test('connect emits connection without a data channel', async function (t) {
   t.plan(1)
 

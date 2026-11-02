@@ -2,6 +2,7 @@ const EventEmitter = require('events')
 const b4a = require('b4a')
 const RPC = require('./lib/rpc.js')
 const Signaling = require('./signaling.js')
+const Client = require('./client.js')
 const crypto = require('hypercore-crypto')
 const bs58 = maybeDefaultModule(require('bs58'))
 
@@ -20,6 +21,7 @@ module.exports = class Server extends EventEmitter {
 
     this.keyPair = opts.keyPair || this.rtc.keyPair
     this.firewall = opts.firewall || (() => true)
+    this.jitter = !!opts.jitter
 
     this.closed = false
     this.closePromise = null
@@ -209,6 +211,23 @@ module.exports = class Server extends EventEmitter {
       return
     }
 
+    for (const [target, peer] of this.joinedPeers) {
+      peer.topics.delete(topic)
+
+      if (peer.topics.size > 0) {
+        continue
+      }
+
+      if (peer.timeout) {
+        clearTimeout(peer.timeout)
+        peer.timeout = null
+      }
+
+      if (!peer.connection) {
+        this.joinedPeers.delete(target)
+      }
+    }
+
     if (this.joinedTopics.size === 0 && this._lookupInterval) {
       clearInterval(this._lookupInterval)
       this._lookupInterval = null
@@ -295,27 +314,97 @@ module.exports = class Server extends EventEmitter {
 
         const target = b4a.toString(peer.publicKey, 'hex')
 
-        if (this.joinedPeers.has(target)) {
-          continue
+        let joined = this.joinedPeers.get(target)
+
+        if (!joined) {
+          joined = {
+            publicKey: peer.publicKey,
+            topics: new Set(),
+            connection: null,
+            timeout: null,
+            attempt: 0
+          }
+
+          this.joinedPeers.set(target, joined)
         }
 
-        const connection = this.rtc.connect(peer.publicKey)
+        joined.topics.add(topic)
 
-        this.joinedPeers.set(target, connection)
-
-        connection.addEventListener('connectionstatechange', () => {
-          if (connection.connectionState !== 'closed') {
-            return
-          }
-
-          if (this.joinedPeers.get(target) === connection) {
-            this.joinedPeers.delete(target)
-          }
-        })
-
-        this.emit('connection', connection)
+        this._connectJoinedPeer(joined)
       }
     }
+  }
+
+  _connectJoinedPeer (peer) {
+    if (this.closed || this.rtc.closing || this.rtc.closed) {
+      return
+    }
+
+    if (peer.topics.size === 0 || peer.connection || peer.timeout) {
+      return
+    }
+
+    if (this.rtc.debug) console.log('[Server] connecting to peer', b4a.toString(peer.publicKey, 'hex'))
+
+    let client = null
+
+    try {
+      client = new Client(this.rtc, peer.publicKey)
+    } catch (err) {
+      if (this.rtc.debug) console.error(err)
+
+      this._retryJoinedPeer(peer)
+
+      return
+    }
+
+    const connection = client.connection
+    peer.connection = connection
+
+    const onStateChange = () => {
+      if (connection.connectionState === 'connected') {
+        peer.attempt = 0
+      }
+    }
+
+    connection.addEventListener('connectionstatechange', onStateChange)
+
+    client.peer.once('close', () => {
+      connection.removeEventListener('connectionstatechange', onStateChange)
+
+      peer.connection = null
+
+      if (peer.topics.size === 0) {
+        this.joinedPeers.delete(b4a.toString(peer.publicKey, 'hex'))
+        return
+      }
+
+      this._retryJoinedPeer(peer)
+    })
+
+    this.emit('connection', connection)
+  }
+
+  _retryJoinedPeer (peer) {
+    if (this.closed || this.rtc.closing || this.rtc.closed) {
+      return
+    }
+
+    if (peer.topics.size === 0 || peer.connection || peer.timeout) {
+      return
+    }
+
+    const delays = [1000, 5000, 15000, 10 * 60 * 1000]
+    const jitter = this.jitter ? 0.5 + Math.random() : 1
+    const delay = Math.round(delays[Math.min(peer.attempt++, delays.length - 1)] * jitter)
+
+    if (this.rtc.debug) console.log('[Server] retrying peer', b4a.toString(peer.publicKey, 'hex'), 'in', delay, 'ms')
+
+    peer.timeout = setTimeout(() => {
+      peer.timeout = null
+
+      this._connectJoinedPeer(peer)
+    }, delay)
   }
 
   async _unannounceTopics (keyPair) {
@@ -381,9 +470,17 @@ module.exports = class Server extends EventEmitter {
 
     const joinedPeers = Array.from(this.joinedPeers.values())
 
-    for (const connection of joinedPeers) {
+    for (const peer of joinedPeers) {
+      if (peer.timeout) {
+        clearTimeout(peer.timeout)
+      }
+
+      if (!peer.connection) {
+        continue
+      }
+
       try {
-        await connection.close()
+        await peer.connection.close()
       } catch (err) {
         if (this.rtc.debug) console.error(err)
       }

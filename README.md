@@ -231,6 +231,8 @@ If the server is listening, it also announces itself under that topic.
 
 The server emits a `connection` event for each discovered connection.
 
+Closed connections are retried after 1 second, 5 seconds, 15 seconds, then every 10 minutes.
+
 #### `await server.leave(topic)`
 
 Stops finding peers under `topic`.
@@ -240,6 +242,8 @@ If only `server.join(topic)` announced the `topic`, it also removes that announc
 An announcement made from `server.announce(topic)` stays active.
 
 Existing peer connections stay open.
+
+Cancels retries unless the peer was also discovered under another joined topic.
 
 #### `await server.close()`
 
