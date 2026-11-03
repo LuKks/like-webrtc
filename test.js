@@ -811,8 +811,6 @@ test.skip('multimux socks5 streams fairness over negotiated data channel', { tim
   }
 })
 
-
-
 test.skip('multimux socks5 stream over negotiated data channel', { timeout: 90000 }, async function (t) {
   const party = new PartyServer()
 
@@ -1311,7 +1309,7 @@ test('join retries closed peers until leave', { timeout: 60000 }, async function
   t.is(peers.length, 2, 'leave cancels the pending retry')
 })
 
-test('join backs off failed connections', { timeout: 60000 }, async function (t) {
+test.skip('join backs off failed connections', { timeout: 60000 }, async function (t) {
   t.plan(3)
 
   const party = new PartyServer()

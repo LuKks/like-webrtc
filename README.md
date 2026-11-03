@@ -340,6 +340,4 @@ This was a one-week kind of thing. I built it while using two React Native insta
 
 ## License
 
-MIT
-
-Copyright (c) 2026 Lucas Barrena
+MIT. Copyright (c) Lucas Barrena

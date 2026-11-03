@@ -15,6 +15,8 @@ const Server = require('./server.js')
 const Client = require('./client.js')
 
 module.exports = class WebRTC {
+  static Peer = Peer
+
   static WebSocketDuplex = WebSocketDuplex
   static DataChannelDuplex = DataChannelDuplex
   static SocketDuplex = SocketDuplex
@@ -38,43 +40,10 @@ module.exports = class WebRTC {
 
     this.signaling = opts.signaling || 'wss://party.leet.ar:41337'
 
-    // Don't use arrays for urls
-    this.iceServers = opts.iceServers || [
-      {
-        urls: 'stun:turn.leet.ar:3478'
-      },
-      {
-        urls: 'stun:stun.l.google.com:19302'
-      },
-      {
-        urls: 'stun:stun.cloudflare.com:3478'
-      },
+    // Defaults in lib/peer.js
+    this.iceServers = opts.iceServers || null
+    this.iceTransportPolicy = opts.iceTransportPolicy || null
 
-      // TODO: Werift doesn't support TURNS
-      /* {
-        urls: 'turns:turn.leet.ar:5349?transport=udp',
-        username: 'us3rn4m3',
-        credential: 'p4$$w0rd'
-      },
-      {
-        urls: 'turns:turn.leet.ar:5349?transport=tcp',
-        username: 'us3rn4m3',
-        credential: 'p4$$w0rd'
-      }, */
-
-      {
-        urls: 'turn:turn.leet.ar:3478?transport=udp',
-        username: 'us3rn4m3',
-        credential: 'p4$$w0rd'
-      },
-      {
-        urls: 'turn:turn.leet.ar:3478?transport=tcp',
-        username: 'us3rn4m3',
-        credential: 'p4$$w0rd'
-      }
-    ]
-
-    this.iceTransportPolicy = opts.iceTransportPolicy || 'all'
     this.trickle = opts.trickle !== false
 
     this.clients = new Set()
@@ -299,9 +268,6 @@ module.exports = class WebRTC {
     remotePublicKey = normalizeKey(remotePublicKey)
 
     const keyPair = signaling.keyPair || this.keyPair
-    const localPublicKey = keyPair.publicKey
-
-    const polite = isPolitePeer(localPublicKey, remotePublicKey)
 
     const peer = new Peer({
       signaling,
@@ -309,24 +275,22 @@ module.exports = class WebRTC {
 
       isInitiator,
 
-      localPublicKey,
+      publicKey: keyPair.publicKey,
       remotePublicKey,
-      polite,
+      polite: isPolitePeer(keyPair.publicKey, remotePublicKey),
 
       RTCPeerConnection: this.RTCPeerConnection,
       RTCIceCandidate: this.RTCIceCandidate,
 
-      configuration: {
-        iceServers: this.iceServers,
-        iceTransportPolicy: this.iceTransportPolicy
-      },
+      iceServers: this.iceServers,
+      iceTransportPolicy: this.iceTransportPolicy,
 
       trickle: this.trickle,
       debug: this.debug
     })
 
-    peer.connection.address = bs58.encode(localPublicKey)
-    peer.connection.publicKey = localPublicKey
+    peer.connection.address = bs58.encode(keyPair.publicKey)
+    peer.connection.publicKey = keyPair.publicKey
 
     peer.once('close', () => {
       if (this.peers.get(token) === peer) {
