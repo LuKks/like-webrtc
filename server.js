@@ -1,7 +1,5 @@
 const EventEmitter = require('events')
 const b4a = require('b4a')
-const RPC = require('./lib/rpc.js')
-const Signaling = require('./signaling.js')
 const Client = require('./client.js')
 const crypto = require('hypercore-crypto')
 const bs58 = maybeDefaultModule(require('bs58'))
@@ -24,6 +22,7 @@ module.exports = class Server extends EventEmitter {
     this.jitter = !!opts.jitter
 
     this.closed = false
+    this.peers = new Set()
     this.closePromise = null
     this.announcedTopics = new Set()
     this.manualAnnouncedTopics = new Set()
@@ -32,24 +31,16 @@ module.exports = class Server extends EventEmitter {
     this.joinedPeers = new Map()
     this._lookupInterval = null
 
-    this.pendingIce = new Map()
-    this.pendingPeerCreates = new Map()
-    this.pendingIceTimeout = opts.pendingIceTimeout || 30 * 1000
-
-    this.signaling = new Signaling(this.rtc, this.keyPair, { _tag: 'server' })
-
-    this.signaling._connect = this._onConnect.bind(this)
-    this.signaling._negotiation = this._onNegotiation.bind(this)
-    this.signaling._ice = this._onIce.bind(this)
-    this.signaling._ack = this._onAck.bind(this)
+    this.signaling = this.rtc._getSignaling(this.keyPair)
+    this.signaling._retain(this)
 
     this._onSignalingOnline = () => {
       if (this.closed || this.rtc.closing || this.rtc.closed) {
         return
       }
 
-      if (this._announceInterval) {
-        this._announce(this.keyPair).catch(err => {
+      if (this.signaling._server === this) {
+        this._announce(this.keyPair, this.signaling).catch(err => {
           if (this.rtc.debug) console.error(err)
         })
 
@@ -58,8 +49,6 @@ module.exports = class Server extends EventEmitter {
         })
       }
     }
-
-    this.signaling.on('online', this._onSignalingOnline)
   }
 
   async listen (keyPair) {
@@ -67,37 +56,84 @@ module.exports = class Server extends EventEmitter {
       throw new Error('Server is closing or closed')
     }
 
-    const previous = this.keyPair
-
     if (!keyPair) {
       keyPair = this.keyPair
     }
 
-    // TODO: Being defensive with b4a.from to avoid RN errors
-    const changed = !b4a.equals(b4a.from(keyPair.publicKey), b4a.from(previous.publicKey))
-    this.keyPair = keyPair
+    const previous = this.signaling
+    const signaling = this.rtc._getSignaling(keyPair)
+    const wasListening = previous._server === this
 
-    await this._announce(this.keyPair)
+    signaling._retain(this)
 
-    if (changed) {
-      await this._unannounceTopics(previous)
+    try {
+      await this._announce(keyPair, signaling)
 
-      try {
-        await this._unannounce(previous)
-      } catch (err) {
-        if (this.rtc.debug) console.error(err)
+      if (this.closed || this.rtc.closing || this.rtc.closed) {
+        await this._unannounce(keyPair, signaling)
+
+        throw new Error('Server is closing or closed')
       }
+    } catch (err) {
+      if (signaling !== previous) {
+        await signaling._release(this)
+      }
+
+      throw err
     }
 
-    await this._announceTopics()
+    if (signaling !== previous) {
+      if (wasListening) {
+        previous._server = null
+      }
+
+      this.signaling = signaling
+      this.keyPair = keyPair
+
+      previous._clearIncoming(this)
+    }
+
+    const server = signaling._server
+
+    signaling._server = this
+
+    if (server && server !== this) {
+      await this._replaceListener(server)
+    }
+
+    if (signaling !== previous) {
+      if (wasListening) {
+        await this._unannounceTopics(previous.keyPair, previous)
+
+        try {
+          await this._unannounce(previous.keyPair, previous)
+        } catch (err) {
+          if (this.rtc.debug) console.error(err)
+        }
+      }
+
+      await previous._release(this)
+    }
+
+    if (server && server !== this) {
+      this._announceTopics().catch(err => {
+        if (this.rtc.debug) console.error(err)
+      })
+    } else {
+      await this._announceTopics()
+    }
+
+    if (this.signaling._server !== this || this.closed || this.rtc.closing || this.rtc.closed) {
+      return
+    }
 
     if (!this._announceInterval) {
       this._announceInterval = setInterval(() => {
-        if (this.closed || this.rtc.closing || this.rtc.closed) {
+        if (this.signaling._server !== this || this.closed || this.rtc.closing || this.rtc.closed) {
           return
         }
 
-        this._announce(this.keyPair).catch(err => {
+        this._announce(this.keyPair, this.signaling).catch(err => {
           if (this.rtc.debug) console.error(err)
         })
 
@@ -117,7 +153,7 @@ module.exports = class Server extends EventEmitter {
       throw new Error('Server is closing or closed')
     }
 
-    if (!this._announceInterval) {
+    if (this.signaling._server !== this) {
       throw new Error('Server is not listening')
     }
 
@@ -154,6 +190,12 @@ module.exports = class Server extends EventEmitter {
 
     const announced = this.announcedTopics.delete(topic)
     const manuallyAnnounced = this.manualAnnouncedTopics.delete(topic)
+
+    const server = this.signaling._server
+
+    if (server && server !== this && server.announcedTopics.has(topic)) {
+      return
+    }
 
     try {
       await this.rtc.unannounce(topic, { keyPair: this.keyPair })
@@ -241,7 +283,7 @@ module.exports = class Server extends EventEmitter {
   }
 
   // Be aware of replay attacks on reusing past signatures to announce or unannounce
-  async _announce (keyPair) {
+  async _announce (keyPair, signaling) {
     if (this.closed || this.rtc.closing || this.rtc.closed) {
       throw new Error('Server is closing or closed')
     }
@@ -251,11 +293,11 @@ module.exports = class Server extends EventEmitter {
     const message = b4a.concat([b4a.from('party-announce'), b4a.from(timestamp.toString())])
     const signature = crypto.sign(message, keyPair.secretKey)
 
-    await this.signaling.request('announce', { publicKey, timestamp, signature })
+    await signaling.request('announce', { publicKey, timestamp, signature })
   }
 
-  async _unannounce (keyPair) {
-    if (this.signaling.closed || this.rtc.closed) {
+  async _unannounce (keyPair, signaling = this.signaling) {
+    if (signaling.closed || this.rtc.closed || (signaling._server && signaling._server !== this)) {
       return
     }
 
@@ -264,12 +306,36 @@ module.exports = class Server extends EventEmitter {
     const message = b4a.concat([b4a.from('party-unannounce'), b4a.from(timestamp.toString())])
     const signature = crypto.sign(message, keyPair.secretKey)
 
-    await this.signaling.request('unannounce', { publicKey, timestamp, signature }, { _allowClosing: true })
+    await signaling.request('unannounce', { publicKey, timestamp, signature }, { _allowClosing: true })
+  }
+
+  async _replaceListener (server) {
+    clearInterval(server._announceInterval)
+    server._announceInterval = null
+
+    for (const topic of server.announcedTopics) {
+      if (this.unannouncedTopics.has(topic)) {
+        continue
+      }
+
+      this.announcedTopics.add(topic)
+
+      if (server.manualAnnouncedTopics.has(topic)) {
+        this.manualAnnouncedTopics.add(topic)
+      }
+    }
+
+    const unannouncing = server._unannounceTopics(server.keyPair)
+
+    server.announcedTopics.clear()
+    server.manualAnnouncedTopics.clear()
+
+    return unannouncing
   }
 
   async _announceTopics () {
     for (const topic of this.announcedTopics) {
-      if (this.closed || this.rtc.closing || this.rtc.closed) {
+      if (this.signaling._server !== this || this.closed || this.rtc.closing || this.rtc.closed) {
         return
       }
 
@@ -283,7 +349,7 @@ module.exports = class Server extends EventEmitter {
         return
       }
 
-      if (this._announceInterval && !this.announcedTopics.has(topic) && !this.unannouncedTopics.has(topic)) {
+      if (this.signaling._server === this && !this.announcedTopics.has(topic) && !this.unannouncedTopics.has(topic)) {
         this.announcedTopics.add(topic)
 
         try {
@@ -349,7 +415,7 @@ module.exports = class Server extends EventEmitter {
     let client = null
 
     try {
-      client = new Client(this.rtc, peer.publicKey)
+      client = new Client(this.rtc, peer.publicKey, { keyPair: this.keyPair })
     } catch (err) {
       if (this.rtc.debug) console.error(err)
 
@@ -407,8 +473,14 @@ module.exports = class Server extends EventEmitter {
     }, delay)
   }
 
-  async _unannounceTopics (keyPair) {
-    for (const topic of this.announcedTopics) {
+  async _unannounceTopics (keyPair, signaling = this.signaling) {
+    for (const topic of Array.from(this.announcedTopics)) {
+      const server = signaling._server
+
+      if (server && server !== this && server.announcedTopics.has(topic)) {
+        continue
+      }
+
       try {
         await this.rtc.unannounce(topic, { keyPair })
       } catch (err) {
@@ -432,6 +504,12 @@ module.exports = class Server extends EventEmitter {
 
     this.closed = true
 
+    const wasListening = this.signaling._server === this
+
+    if (wasListening) {
+      this.signaling._server = null
+    }
+
     if (this._announceInterval) {
       clearInterval(this._announceInterval)
       this._announceInterval = null
@@ -444,23 +522,14 @@ module.exports = class Server extends EventEmitter {
 
     this.joinedTopics.clear()
 
-    this._clearPendingIce()
-    this.pendingPeerCreates.clear()
-
-    if (this.signaling && this._onSignalingOnline) {
-      this.signaling.removeListener('online', this._onSignalingOnline)
-    }
+    this.signaling._clearIncoming(this)
 
     // Close peers before unannounce/signaling teardown. This prevents late
     // offers/candidates from racing with server shutdown and creating orphan
     // RTCPeerConnections.
-    const peers = Array.from(this.rtc.peers.values())
+    const peers = Array.from(this.peers)
 
     for (const peer of peers) {
-      if (peer.signaling !== this.signaling) {
-        continue
-      }
-
       try {
         await peer.connection.close()
       } catch (err) {
@@ -495,6 +564,7 @@ module.exports = class Server extends EventEmitter {
     this.unannouncedTopics.clear()
 
     if (
+      wasListening &&
       this.signaling &&
       this.signaling.rpc &&
       this.signaling.rpc.opened &&
@@ -509,13 +579,12 @@ module.exports = class Server extends EventEmitter {
     }
 
     try {
-      await this.signaling.close()
+      await this.signaling._release(this)
     } catch (err) {
       if (this.rtc.debug) console.error(err)
     }
 
     this.rtc.servers.delete(this)
-    this.removeAllListeners()
   }
 
   get address () {
@@ -555,194 +624,19 @@ module.exports = class Server extends EventEmitter {
     return false
   }
 
-  async _onConnect (req) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    const peer = await this._getOrCreatePeer(req)
-
-    if (peer.closed || peer.closing) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-  }
-
-  async _onNegotiation (req) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    const peer = await this._getOrCreatePeer(req)
-
-    await this.rtc._negotiation(peer, req)
-
-    peer.sendAck(req.body.messageId)
-  }
-
-  async _onIce (req) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    let peer = this.rtc.peers.get(req.body.token)
-
-    if (!peer) {
-      const pending = this.pendingPeerCreates.get(req.body.token)
-
-      if (pending) {
-        peer = await pending
-        await this.rtc._ice(peer, req)
-        peer.sendAck(req.body.messageId)
-        return
-      }
-
-      if (!(await this._firewall(req.body.remotePublicKey))) {
-        throw new RPC.Error('PEER_CONNECTION_FAILED')
-      }
-
-      if (this.closed || this.rtc.closing || this.rtc.closed) {
-        throw new RPC.Error('PEER_CONNECTION_FAILED')
-      }
-
-      this._queuePendingIce(req.body.token, req.body.candidate, req.body.messageId)
-
-      return
-    }
-
-    await this.rtc._ice(peer, req)
-
-    peer.sendAck(req.body.messageId)
-  }
-
-  async _onAck (req) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    if (!req.body || typeof req.body.token !== 'string') {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    const peer = this.rtc.peers.get(req.body.token)
-
-    if (!peer) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    await this.rtc._ack(peer, req)
-  }
-
-  async _getOrCreatePeer (req) {
+  _createIncomingPeer (req) {
     const token = req.body.token
+    const peer = this.rtc._createPeer(this.signaling, false, req.body.remotePublicKey, token)
 
-    const peer = this.rtc.peers.get(token)
+    this.peers.add(peer)
 
-    if (peer) {
-      return peer
-    }
-
-    const pending = this.pendingPeerCreates.get(token)
-
-    if (pending) {
-      return pending
-    }
-
-    if (req.method !== 'webrtc-connect' && (!req.body.description || req.body.description.type !== 'offer')) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    const creating = this._createIncomingPeer(req)
-      .finally(() => {
-        this.pendingPeerCreates.delete(token)
-      })
-
-    this.pendingPeerCreates.set(token, creating)
-
-    return creating
-  }
-
-  async _createIncomingPeer (req) {
-    const token = req.body.token
-
-    if (!(await this._firewall(req.body.remotePublicKey))) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    // Another concurrent request may have created it while firewall awaited.
-    let peer = this.rtc.peers.get(token)
-
-    if (peer) {
-      return peer
-    }
-
-    peer = this.rtc._createPeer(this.signaling, false, req.body.remotePublicKey, token)
+    peer.once('close', () => {
+      this.peers.delete(peer)
+    })
 
     this.emit('connection', peer.connection)
 
-    for (const pending of this._takePendingIce(token)) {
-      await peer.handleCandidate(pending.candidate, pending.messageId)
-
-      peer.sendAck(pending.messageId)
-    }
-
     return peer
-  }
-
-  _queuePendingIce (token, candidate, messageId) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      return
-    }
-
-    let pending = this.pendingIce.get(token)
-
-    if (!pending) {
-      pending = {
-        candidates: [],
-        timeout: null
-      }
-
-      this.pendingIce.set(token, pending)
-    }
-
-    pending.candidates.push({ candidate, messageId })
-
-    if (pending.timeout) {
-      clearTimeout(pending.timeout)
-    }
-
-    pending.timeout = setTimeout(() => {
-      this.pendingIce.delete(token)
-    }, this.pendingIceTimeout)
-  }
-
-  _takePendingIce (token) {
-    const pending = this.pendingIce.get(token)
-
-    if (!pending) {
-      return []
-    }
-
-    if (pending.timeout) {
-      clearTimeout(pending.timeout)
-    }
-
-    this.pendingIce.delete(token)
-
-    return pending.candidates
-  }
-
-  _clearPendingIce () {
-    for (const pending of this.pendingIce.values()) {
-      if (pending.timeout) {
-        clearTimeout(pending.timeout)
-      }
-    }
-
-    this.pendingIce.clear()
   }
 }
 

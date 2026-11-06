@@ -50,7 +50,6 @@ module.exports = class WebRTC {
     this.servers = new Set()
     this.peers = new Map()
     this.signalings = new Set()
-    this._partySignaling = null
 
     this.debug = !!opts.debug
 
@@ -91,17 +90,6 @@ module.exports = class WebRTC {
     for (const server of servers) {
       try {
         await server.close()
-      } catch (err) {
-        if (this.debug) console.error(err)
-      }
-    }
-
-    const partySignaling = this._partySignaling
-    this._partySignaling = null
-
-    if (partySignaling) {
-      try {
-        await partySignaling.close()
       } catch (err) {
         if (this.debug) console.error(err)
       }
@@ -148,8 +136,6 @@ module.exports = class WebRTC {
     return this.keyPair.publicKey
   }
 
-  // TODO: Multiplex to avoid multiple signaling sockets
-  // TODO: To reuse the same signaling socket: WebSocket -> Multiplex -> SecretStream -> RPC
   // TODO: Maybe signaling server could be a HTTPS server with EventSource
   _createSignalingStream () {
     if (this.closing || this.closed) {
@@ -207,7 +193,7 @@ module.exports = class WebRTC {
     ])
     const signature = crypto.sign(message, keyPair.secretKey)
 
-    const signaling = this._getPartySignaling()
+    const signaling = this._getPartySignaling(keyPair)
 
     return signaling.request('announce', {
       topic,
@@ -232,7 +218,7 @@ module.exports = class WebRTC {
     ])
     const signature = crypto.sign(message, keyPair.secretKey)
 
-    const signaling = this._getPartySignaling()
+    const signaling = this._getPartySignaling(keyPair)
 
     return signaling.request('unannounce', {
       topic,
@@ -252,12 +238,26 @@ module.exports = class WebRTC {
     return signaling.request('lookup', { topic })
   }
 
-  _getPartySignaling () {
-    if (!this._partySignaling) {
-      this._partySignaling = new Signaling(this, this.keyPair, { _tag: 'rtc' })
+  _getPartySignaling (keyPair) {
+    const signaling = this._getSignaling(keyPair || this.keyPair)
+
+    signaling._retain(this)
+
+    return signaling
+  }
+
+  _getSignaling (keyPair) {
+    for (const signaling of this.signalings) {
+      if (!signaling.closed && b4a.equals(keyPair.publicKey, signaling.keyPair.publicKey)) {
+        return signaling
+      }
     }
 
-    return this._partySignaling
+    if (this.closing || this.closed) {
+      throw new Error('WebRTC is closing or closed')
+    }
+
+    return new Signaling(this, keyPair)
   }
 
   _createPeer (signaling, isInitiator, remotePublicKey, token) {
@@ -295,10 +295,16 @@ module.exports = class WebRTC {
     peer.once('close', () => {
       if (this.peers.get(token) === peer) {
         this.peers.delete(token)
+
+        signaling._release(peer).catch(err => {
+          if (this.debug) console.error(err)
+        })
       }
     })
 
     this.peers.set(token, peer)
+
+    signaling._retain(peer)
 
     return peer
   }

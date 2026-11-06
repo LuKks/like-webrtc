@@ -2,6 +2,7 @@
 
 // TODO: Slightly messy and some draft code, but some important edge cases are being tested
 
+const { EventEmitter } = require('events')
 const test = require('get-npm-global')('brittle')
 const { Duplex, pipeline } = require('streamx')
 const b4a = require('b4a')
@@ -368,6 +369,643 @@ test('first data channel negotiation is coalesced', { timeout: 90000 }, async fu
   await a.close()
   await b.close()
   await party.close()
+})
+
+test('negotiated channels survive signaling reconnect and renegotiation', { timeout: 30000 }, async function (t) {
+  t.plan(3)
+
+  const party = new PartyServer()
+  const sockets = new Set()
+  let reconnected
+  const signaling = await createWebSocketServer(t, (socket, req) => {
+    if (req.url === '/client') {
+      sockets.add(socket)
+      socket.once('close', () => sockets.delete(socket))
+
+      if (reconnected) reconnected()
+    }
+
+    party.handle(new RTC.WebSocketDuplex(socket))
+  })
+
+  const a = new RTC({ signaling, iceServers: [] })
+  const b = new RTC({ signaling: signaling + '/client', iceServers: [] })
+
+  t.teardown(async () => {
+    await a.close()
+    await b.close()
+    await party.close()
+  })
+
+  let remote
+
+  const server = a.createServer(peer => {
+    remote = peer
+
+    echoDataChannel(peer.createDataChannel('chat', { negotiated: true, id: 1 }))
+  })
+
+  const listener = b.createServer()
+
+  await server.listen()
+  await listener.listen()
+
+  const connection = b.connect(server.publicKey)
+  const channel = new RTC.DataChannelDuplex(connection.createDataChannel('chat', { negotiated: true, id: 1 }))
+
+  channel.on('error', noop)
+
+  const before = waitEvent(channel, 'data', 10000, 'chat before reconnect')
+
+  channel.write('before reconnect')
+
+  t.is((await before).toString(), 'before reconnect', 'negotiated channel works')
+
+  const reconnecting = new Promise(resolve => { reconnected = resolve })
+  const closing = Array.from(sockets, socket => {
+    const closed = waitEvent(socket, 'close', 10000, 'signaling socket closes')
+
+    socket.terminate()
+
+    return closed
+  })
+
+  await Promise.all(closing)
+  await reconnecting
+  await b.lookup('signaling-reconnected')
+
+  const description = connection.remoteDescription.sdp
+
+  remote.restartIce()
+
+  await waitForCondition(() => {
+    return connection.remoteDescription.sdp !== description &&
+      connection.signalingState === 'stable' &&
+      remote.signalingState === 'stable'
+  }, 10000, 'ICE restart after signaling reconnect')
+
+  t.ok(isPeerConnected(connection), 'renegotiation completes after signaling reconnect')
+
+  const after = waitEvent(channel, 'data', 10000, 'chat after reconnect')
+
+  channel.write('after reconnect')
+
+  t.is((await after).toString(), 'after reconnect', 'existing channel still delivers messages')
+})
+
+test('receiver can start with only a data channel or media', { timeout: 30000 }, async function (t) {
+  t.plan(3)
+
+  for (const media of [false, true]) {
+    const party = new PartyServer()
+    const signaling = await createWebSocketServer(t, socket => party.handle(new RTC.WebSocketDuplex(socket)))
+
+    const a = new RTC({ signaling, iceServers: [] })
+    const b = new RTC({ signaling, iceServers: [] })
+
+    t.teardown(async () => {
+      await a.close()
+      await b.close()
+      await party.close()
+    })
+
+    let channel
+    let transceiver
+
+    const server = a.createServer(peer => {
+      if (media) {
+        transceiver = peer.addTransceiver('audio', { direction: 'recvonly' })
+      } else {
+        channel = new RTC.DataChannelDuplex(peer.createDataChannel('receiver-first'))
+
+        channel.on('error', noop)
+      }
+    })
+
+    await server.listen()
+
+    const connection = b.connect(server.publicKey)
+
+    connection.ondatachannel = event => echoDataChannel(event.channel)
+
+    if (media) {
+      await waitForCondition(() => isPeerConnected(connection), 10000, 'receiver-only media connection')
+
+      t.ok(transceiver.mid !== null && /m=audio /.test(connection.remoteDescription.sdp), 'receiver media is negotiated')
+      t.absent(/m=application /.test(connection.localDescription.sdp), 'media connects without a data channel')
+    } else {
+      await waitForCondition(() => !!channel, 10000, 'receiver channel creation')
+
+      const echoed = waitEvent(channel, 'data', 10000, 'receiver initiated echo')
+
+      channel.write('receiver first')
+
+      t.is((await echoed).toString(), 'receiver first', 'receiver-created channel delivers messages')
+    }
+
+    await a.close()
+    await b.close()
+    await party.close()
+  }
+})
+
+test('simultaneous first offers recover with either polite peer', { timeout: 30000 }, async function (t) {
+  t.plan(10)
+
+  for (const polite of [false, true]) {
+    for (const media of [false, true]) {
+      const pair = createNegotiationPair(t, polite)
+      const channels = pair.peers.map(peer => peer.createDataChannel('chat', { negotiated: true, id: 1 }))
+      const transceivers = media
+        ? pair.peers.map(peer => peer.addTransceiver('audio', { direction: 'recvonly' }))
+        : []
+
+      await waitForCondition(() => {
+        return [0, 1].every(from => pair.messages.some(message => message.from === from && message.body.description?.type === 'offer'))
+      }, 5000, 'both first offers')
+
+      pair.open()
+
+      await waitForCondition(() => channels.every(channel => channel.readyState === 'open'), 5000, 'glare recovery')
+
+      const received = channels.map(channel => new Promise(resolve => {
+        channel.onmessage = event => resolve(event.data)
+      }))
+
+      channels[0].send('caller')
+      channels[1].send('receiver')
+
+      t.alike(await Promise.all(received), ['receiver', 'caller'], 'messages work in both directions')
+
+      await waitForCondition(() => {
+        return pair.peers.every(peer => peer.connection.signalingState === 'stable') &&
+          transceivers.every(transceiver => transceiver.mid !== null)
+      }, 5000, 'negotiation settles')
+
+      t.alike(pair.peers.map(peer => peer.connection.signalingState), ['stable', 'stable'], 'both peers settle')
+
+      if (media) {
+        t.ok(transceivers.every(transceiver => transceiver.mid !== null && !transceiver.stopped), 'both requested media transceivers survive glare')
+      }
+
+      await Promise.all(pair.peers.map(peer => peer.close()))
+    }
+  }
+})
+
+test('ICE received during glare survives signaling reconnect before the answer', { timeout: 30000 }, async function (t) {
+  t.plan(3)
+
+  const pair = createNegotiationPair(t, true)
+  const [polite, impolite] = pair.peers
+  const channels = pair.peers.map(peer => peer.createDataChannel('chat', { negotiated: true, id: 1 }))
+
+  pair.hold = message => message.body.description?.type === 'answer' || message.name === 'webrtc-ack'
+
+  await waitForCondition(() => {
+    return [0, 1].every(from => pair.messages.some(message => message.from === from && message.body.description?.type === 'offer'))
+  }, 5000, 'both first offers')
+
+  pair.open()
+
+  await waitForCondition(() => {
+    return polite.connection.iceGatheringState === 'complete' &&
+      pair.messages.some(message => message.from === 0 && message.body.description?.type === 'answer')
+  }, 5000, 'held answer and candidates')
+
+  const answer = pair.messages.find(message => message.from === 0 && message.body.description?.type === 'answer')
+  const ufrag = answer.body.description.sdp.match(/^a=ice-ufrag:(.+)$/m)[1].trim()
+
+  // Observe the queue here so the test cannot pass solely through peer-reflexive ICE.
+  await waitForCondition(() => impolite.pendingCandidates.some(candidate => candidate?.usernameFragment === ufrag), 5000, 'answer candidates before the answer')
+
+  t.is(impolite.connection.remoteDescription, null, 'ICE arrives before the held answer')
+
+  pair.hold = null
+  pair.open()
+
+  await waitForCondition(() => channels.every(channel => channel.readyState === 'open'), 5000, 'connection after signaling reconnect')
+
+  const received = channels.map(channel => new Promise(resolve => {
+    channel.onmessage = event => resolve(event.data)
+  }))
+
+  channels[0].send('caller')
+  channels[1].send('receiver')
+
+  t.alike(await Promise.all(received), ['receiver', 'caller'], 'messages work after the delayed answer')
+  t.alike(pair.peers.map(peer => peer.connection.signalingState), ['stable', 'stable'], 'both peers settle after reconnect')
+})
+
+test('closing a listener preserves independent outgoing peers', { timeout: 30000 }, async function (t) {
+  t.plan(5)
+
+  const party = new PartyServer()
+  const signaling = await createWebSocketServer(t, socket => party.handle(new RTC.WebSocketDuplex(socket)))
+
+  const a = new RTC({ signaling, iceServers: [] })
+  const b = new RTC({ signaling, iceServers: [] })
+
+  t.teardown(async () => {
+    await a.close()
+    await b.close()
+    await party.close()
+  })
+
+  const server = a.createServer(peer => {
+    peer.ondatachannel = event => echoDataChannel(event.channel)
+  })
+
+  const listener = b.createServer()
+
+  await server.listen()
+  await listener.listen()
+
+  const connections = [b.connect(server.publicKey), b.connect(server.publicKey)]
+
+  await Promise.all(connections.map((peer, index) => echoRoundTrip(t, peer, 'wire', 'message ' + index)))
+  await connections[0].close()
+
+  await echoRoundTrip(t, connections[1], 'after-client-close', 'other client survives')
+
+  await listener.close()
+
+  await echoRoundTrip(t, connections[1], 'after-listener-close', 'independent client survives')
+
+  await connections[1].close()
+
+  const next = b.connect(server.publicKey)
+
+  await echoRoundTrip(t, next, 'later-client', 'new connections still work')
+})
+
+test('closing clients for another identity releases idle signaling sockets', { timeout: 30000 }, async function (t) {
+  t.plan(7)
+
+  const party = new PartyServer()
+  const sockets = new Set()
+  const signaling = await createWebSocketServer(t, (socket, req) => {
+    if (req.url === '/client') {
+      sockets.add(socket)
+      socket.once('close', () => sockets.delete(socket))
+    }
+
+    party.handle(new RTC.WebSocketDuplex(socket))
+  })
+
+  const a = new RTC({ signaling, iceServers: [] })
+  const b = new RTC({ signaling: signaling + '/client', iceServers: [] })
+
+  t.teardown(async () => {
+    await a.close()
+    await b.close()
+    await party.close()
+  })
+
+  const identities = []
+  const server = a.createServer({
+    firewall (publicKey) {
+      identities.push(b4a.toString(publicKey, 'hex'))
+
+      return true
+    }
+  }, peer => {
+    peer.ondatachannel = event => echoDataChannel(event.channel)
+  })
+
+  const listener = b.createServer(peer => {
+    peer.ondatachannel = event => echoDataChannel(event.channel)
+  })
+
+  await server.listen()
+  await listener.listen()
+
+  const baseline = sockets.size
+  const keyPair = RTC.keyPair()
+  const first = b.connect(server.publicKey, { keyPair })
+  const second = b.connect(server.publicKey, { keyPair })
+
+  await echoRoundTrip(t, first, 'first-identity-client', 'first')
+  await echoRoundTrip(t, second, 'second-identity-client', 'second')
+
+  t.alike(identities, [keyPair, keyPair].map(key => b4a.toString(key.publicKey, 'hex')), 'both clients use the requested identity')
+
+  await first.close()
+
+  await echoRoundTrip(t, second, 'remaining-client', 'other client survives')
+
+  await second.close()
+  await waitForCondition(() => sockets.size === baseline, 10000, 'unused signaling sockets close')
+
+  t.is(sockets.size, baseline, 'client-only signaling is released')
+
+  const incoming = a.connect(listener.publicKey)
+
+  await echoRoundTrip(t, incoming, 'remaining-listener', 'other identity keeps listening')
+
+  await listener.close()
+  await waitForCondition(() => sockets.size === 0, 10000, 'final signaling socket closes')
+
+  t.is(sockets.size, 0, 'closing the final owner releases all its sockets')
+})
+
+test('closing a client before signaling opens releases its socket', { timeout: 30000 }, async function (t) {
+  t.plan(2)
+
+  const sockets = new Set()
+  let accepted
+  const opening = new Promise(resolve => { accepted = resolve })
+  const signaling = await createWebSocketServer(t, socket => {
+    sockets.add(socket)
+    socket.once('close', () => sockets.delete(socket))
+
+    accepted()
+  })
+
+  const rtc = new RTC({ signaling, iceServers: [] })
+
+  t.teardown(async () => {
+    await rtc.close()
+
+    for (const socket of sockets) socket.terminate()
+  })
+
+  const connection = rtc.connect(RTC.keyPair().publicKey)
+
+  await opening
+  await connection.close()
+  await waitForCondition(() => sockets.size === 0, 10000, 'opening socket closes')
+
+  t.is(connection.connectionState, 'closed', 'pending connection closes')
+  t.is(sockets.size, 0, 'pending signaling leaves no open socket')
+})
+
+test('concurrent connections and discovery keep working', { timeout: 30000 }, async function (t) {
+  t.plan(7)
+
+  const party = new PartyServer()
+  const signaling = await createWebSocketServer(t, socket => party.handle(new RTC.WebSocketDuplex(socket)))
+
+  const a = new RTC({ signaling, iceServers: [] })
+  const b = new RTC({ signaling, iceServers: [] })
+
+  t.teardown(async () => {
+    await a.close()
+    await b.close()
+    await party.close()
+  })
+
+  const server = a.createServer(peer => {
+    peer.ondatachannel = event => echoDataChannel(event.channel)
+  })
+
+  const topic = 'concurrent-discovery'
+
+  await server.listen()
+  await server.announce(topic)
+
+  const connections = Array.from({ length: 3 }, () => b.connect(server.publicKey))
+
+  await Promise.all(connections.map((peer, index) => echoRoundTrip(t, peer, 'cold ' + index, 'cold ' + index)))
+  await Promise.all(connections.map(peer => peer.close()))
+
+  const found = await b.lookup(topic)
+
+  t.alike(found.map(peer => b4a.toString(peer.publicKey, 'hex')), [b4a.toString(server.publicKey, 'hex')], 'discovery works after concurrent clients close')
+
+  const listener = b.createServer(peer => {
+    peer.ondatachannel = event => echoDataChannel(event.channel)
+  })
+
+  await listener.listen()
+  await listener.announce(topic)
+
+  const announced = await a.lookup(topic)
+
+  t.alike(announced.map(peer => b4a.toString(peer.publicKey, 'hex')).sort(), [server, listener].map(server => b4a.toString(server.publicKey, 'hex')).sort(), 'discovery and listening work together')
+
+  const next = a.connect(listener.publicKey)
+
+  await echoRoundTrip(t, next, 'discovered-listener', 'listener works after discovery')
+
+  await listener.close()
+
+  const remaining = await b.lookup(topic)
+
+  t.alike(remaining.map(peer => b4a.toString(peer.publicKey, 'hex')), [b4a.toString(server.publicKey, 'hex')], 'closing one listener leaves the other publication')
+})
+
+test('a replacement listener accepts new peers while the previous server drains', { timeout: 30000 }, async function (t) {
+  t.plan(12)
+
+  const party = new PartyServer()
+  const signaling = await createWebSocketServer(t, socket => party.handle(new RTC.WebSocketDuplex(socket)))
+
+  const a = new RTC({ signaling, iceServers: [] })
+  const b = new RTC({ signaling, iceServers: [] })
+
+  t.teardown(async () => {
+    await a.close()
+    await b.close()
+    await party.close()
+  })
+
+  const accepted = [[], []]
+  const servers = accepted.map(peers => a.createServer(peer => {
+    peers.push(peer)
+
+    peer.ondatachannel = event => echoDataChannel(event.channel)
+  }))
+
+  const [first, second] = servers
+  const topic = 'listener-handoff'
+  const hidden = 'listener-handoff-hidden'
+
+  await first.listen()
+  await first.announce(topic)
+  await first.announce(hidden)
+  await first.join(topic)
+
+  const previous = b.connect(first.publicKey)
+
+  await echoRoundTrip(t, previous, 'before-handoff', 'before')
+
+  await second.unannounce(hidden)
+  await second.listen()
+
+  const next = b.connect(second.publicKey)
+
+  await echoRoundTrip(t, next, 'after-handoff', 'after')
+
+  t.alike(accepted.map(peers => peers.length), [1, 1], 'new peers go to the replacement handler')
+
+  await echoRoundTrip(t, previous, 'draining-peer', 'previous connection stays active')
+
+  t.is((await b.lookup(topic)).length, 1, 'active topic publication follows the listener')
+  t.is((await b.lookup(hidden)).length, 0, 'replacement respects explicitly withdrawn topics')
+
+  await first.unannounce(topic)
+  await first.leave(topic)
+
+  t.is((await b.lookup(topic)).length, 1, 'previous server cannot withdraw the replacement topic')
+
+  await first.close()
+
+  t.is(accepted[0][0].connectionState, 'closed', 'closing the previous server closes its peers')
+
+  await echoRoundTrip(t, next, 'after-previous-close', 'replacement stays active')
+
+  const later = b.connect(second.publicKey)
+
+  await echoRoundTrip(t, later, 'later-arrival', 'replacement keeps accepting')
+
+  t.alike(accepted.map(peers => peers.length), [1, 2], 'later peers reach the replacement handler')
+
+  await second.close()
+
+  t.is((await b.lookup(topic)).length, 0, 'replacement withdraws its topic on close')
+})
+
+test('pending connections keep their original server and firewall after handoff', { timeout: 30000 }, async function (t) {
+  t.plan(10)
+
+  for (const allowed of [true, false]) {
+    const party = new PartyServer()
+    const signaling = await createWebSocketServer(t, socket => party.handle(new RTC.WebSocketDuplex(socket)))
+
+    const a = new RTC({ signaling, iceServers: [] })
+    const b = new RTC({ signaling, iceServers: [] })
+
+    t.teardown(async () => {
+      await a.close()
+      await b.close()
+      await party.close()
+    })
+
+    const accepted = [[], []]
+    let firstCalls = 0
+    let secondCalls = 0
+    let entered
+    let finish
+    const checking = new Promise(resolve => { entered = resolve })
+    const waiting = new Promise(resolve => { finish = resolve })
+
+    const first = a.createServer({
+      firewall () {
+        firstCalls++
+        entered()
+
+        return waiting
+      }
+    }, peer => {
+      accepted[0].push(peer)
+
+      peer.ondatachannel = event => echoDataChannel(event.channel)
+    })
+
+    const second = a.createServer({
+      firewall () {
+        secondCalls++
+
+        return !allowed
+      }
+    }, peer => {
+      accepted[1].push(peer)
+
+      peer.ondatachannel = event => echoDataChannel(event.channel)
+    })
+
+    await first.listen()
+
+    const previous = b.connect(first.publicKey)
+
+    previous.createDataChannel('before-handoff')
+
+    await checking
+    await second.listen()
+
+    finish(allowed)
+
+    if (allowed) {
+      await echoRoundTrip(t, previous, 'original-policy', 'original firewall allows')
+    } else {
+      await waitForCondition(() => previous.connectionState === 'closed', 5000, 'original firewall refusal')
+
+      t.is(previous.connectionState, 'closed', 'original refusal is preserved')
+    }
+
+    t.is(accepted[0].length, allowed ? 1 : 0, 'pending attempt keeps its original handler')
+    t.is(firstCalls, 1, 'original firewall is evaluated once')
+
+    if (allowed) {
+      t.is(secondCalls, 0, 'replacement firewall is untouched by the original attempt')
+    }
+
+    const next = b.connect(second.publicKey)
+
+    if (allowed) {
+      await waitForCondition(() => next.connectionState === 'closed', 5000, 'replacement firewall refusal')
+
+      t.is(next.connectionState, 'closed', 'fresh attempt uses the replacement refusal')
+    } else {
+      await echoRoundTrip(t, next, 'new-policy', 'replacement firewall allows')
+    }
+
+    if (allowed) {
+      t.is(secondCalls, 1, 'replacement firewall handles the fresh attempt')
+    }
+
+    await a.close()
+    await b.close()
+    await party.close()
+  }
+})
+
+test('listener key changes preserve existing peers', { timeout: 30000 }, async function (t) {
+  t.plan(6)
+
+  const party = new PartyServer()
+  const signaling = await createWebSocketServer(t, socket => party.handle(new RTC.WebSocketDuplex(socket)))
+
+  const a = new RTC({ signaling, iceServers: [] })
+  const b = new RTC({ signaling, iceServers: [] })
+
+  t.teardown(async () => {
+    await a.close()
+    await b.close()
+    await party.close()
+  })
+
+  const firstKey = RTC.keyPair()
+  const secondKey = RTC.keyPair()
+  const accepted = []
+  const server = a.createServer(peer => {
+    accepted.push(peer)
+
+    peer.ondatachannel = event => echoDataChannel(event.channel)
+  })
+
+  await server.listen(firstKey)
+
+  t.alike(server.publicKey, firstKey.publicKey, 'listener uses the selected identity')
+
+  const first = b.connect(firstKey.publicKey)
+
+  await echoRoundTrip(t, first, 'before-key-change', 'selected identity works')
+
+  await server.listen(secondKey)
+
+  t.alike(server.publicKey, secondKey.publicKey, 'listener uses the replacement identity')
+
+  await echoRoundTrip(t, first, 'after-key-change', 'original peer survives')
+
+  const second = b.connect(secondKey.publicKey)
+
+  await echoRoundTrip(t, second, 'new-key', 'replacement identity works')
+
+  await server.close()
+
+  t.alike(accepted.map(peer => peer.connectionState), ['closed', 'closed'], 'server closes peers accepted under either identity')
 })
 
 test('direct data channel end flushes payload before close', { timeout: 90000 }, async function (t) {
@@ -1613,4 +2251,37 @@ function streamPair () {
   })
 
   return [s1, s2]
+}
+
+function createNegotiationPair (t, polite) {
+  const pair = { peers: [], signalings: [], messages: [], hold: null, online: false }
+
+  for (let i = 0; i < 2; i++) {
+    const signaling = new EventEmitter()
+
+    signaling.event = function (name, body) {
+      const message = { from: i, name, body }
+
+      pair.messages.push(message)
+
+      if (!pair.online || pair.hold?.(message)) return false
+
+      queueMicrotask(() => pair.peers[1 - i].signal({ name, body }))
+
+      return true
+    }
+
+    pair.signalings.push(signaling)
+    pair.peers.push(new RTC.Peer({ signaling, polite: i === 0 ? polite : !polite, isInitiator: i === 1, iceServers: [] }))
+  }
+
+  pair.open = function () {
+    pair.online = true
+
+    pair.signalings.forEach(signaling => signaling.emit('online'))
+  }
+
+  t.teardown(() => Promise.all(pair.peers.map(peer => peer.close())))
+
+  return pair
 }

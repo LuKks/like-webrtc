@@ -1,11 +1,12 @@
 require('./lib/sodium.js')
 
 const EventEmitter = require('events')
-const RPC = require('./lib/rpc.js')
+const b4a = require('b4a')
 const SecretStream = require('@hyperswarm/secret-stream')
+const RPC = require('./lib/rpc.js')
 
 module.exports = class Signaling extends EventEmitter {
-  constructor (rtc, keyPair, opts = {}) {
+  constructor (rtc, keyPair) {
     super()
 
     if (rtc.closing || rtc.closed) {
@@ -16,12 +17,9 @@ module.exports = class Signaling extends EventEmitter {
     this.rtc.signalings.add(this)
 
     this.keyPair = keyPair
-
-    // Consumer should implement them
-    this._connect = req => {}
-    this._negotiation = req => {}
-    this._ice = req => {}
-    this._ack = req => {}
+    this._users = new Set()
+    this._server = null
+    this._incoming = new Map()
 
     this.rpc = null
     this.closed = false
@@ -29,8 +27,6 @@ module.exports = class Signaling extends EventEmitter {
 
     this._reconnectTimeout = null
     this._reconnectBackoff = exponentialBackoff({ delay: 100, max: 6 })
-
-    this._tag = opts._tag || null
 
     this._setup()
   }
@@ -63,8 +59,6 @@ module.exports = class Signaling extends EventEmitter {
 
     const rpc = new RPC(stream)
 
-    rpc._tag = this._tag
-
     this.rpc = rpc
 
     this.rpc.on('error', err => {
@@ -86,6 +80,12 @@ module.exports = class Signaling extends EventEmitter {
 
       this._reconnectBackoff.reset()
 
+      for (const user of Array.from(this._users)) {
+        if (user.signaling === this && user._onSignalingOnline) {
+          user._onSignalingOnline()
+        }
+      }
+
       this.emit('online')
     })
 
@@ -99,6 +99,12 @@ module.exports = class Signaling extends EventEmitter {
       }
 
       if (this.rtc.debug) console.log('[Signaling] offline')
+
+      for (const user of Array.from(this._users)) {
+        if (user.signaling === this && user._onSignalingOffline) {
+          user._onSignalingOffline()
+        }
+      }
 
       this.emit('offline')
 
@@ -130,19 +136,17 @@ module.exports = class Signaling extends EventEmitter {
     }
 
     this.closed = true
+    this._users.clear()
+    this._server = null
+    this._clearIncoming()
 
     this.rtc.signalings.delete(this)
     this._clearReconnectTimeout()
-
-    // This code is used by both clients and servers
-    // Server-side peers are owned by the server Signaling instance so we close them
-    // Client-side peers own their signalings so we don't close them here
 
     const peers = Array.from(this.rtc.peers.values())
 
     for (const peer of peers) {
       if (peer.signaling !== this) continue
-      if (peer.isInitiator) continue
 
       try {
         await peer.connection.close()
@@ -210,36 +214,134 @@ module.exports = class Signaling extends EventEmitter {
     this._reconnectTimeout = null
   }
 
-  _onConnect (req) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    return this._connect(req)
+  _retain (user) {
+    this._users.add(user)
   }
 
-  _onNegotiation (req) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
+  async _release (user) {
+    this._users.delete(user)
 
-    return this._negotiation(req)
+    if (this._users.size === 0) {
+      await this.close()
+    }
   }
 
-  _onIce (req) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
+  _getPeer (req) {
+    if (this.closed || this.rtc.closing || this.rtc.closed || !req.body || typeof req.body.token !== 'string') {
       throw new RPC.Error('PEER_CONNECTION_FAILED')
     }
 
-    return this._ice(req)
+    const peer = this.rtc.peers.get(req.body.token)
+
+    if (!peer) {
+      return null
+    }
+
+    if (peer.signaling !== this || req.body.isInitiator === peer.isInitiator || !req.body.remotePublicKey || !b4a.equals(req.body.remotePublicKey, peer.remotePublicKey)) {
+      throw new RPC.Error('PEER_CONNECTION_FAILED')
+    }
+
+    return peer
+  }
+
+  _getOrCreatePeer (req) {
+    const peer = this._getPeer(req)
+
+    if (peer) {
+      if (peer.closed || peer.closing) {
+        throw new RPC.Error('PEER_CONNECTION_FAILED')
+      }
+
+      return peer
+    }
+
+    if (req.body.isInitiator !== true || !req.body.remotePublicKey) {
+      throw new RPC.Error('PEER_CONNECTION_FAILED')
+    }
+
+    const token = req.body.token
+
+    let incoming = this._incoming.get(token)
+
+    if (incoming) {
+      if (!b4a.equals(incoming.remotePublicKey, req.body.remotePublicKey)) {
+        throw new RPC.Error('PEER_CONNECTION_FAILED')
+      }
+
+      return incoming.promise
+    }
+
+    const server = this._server
+
+    if (!server || server.closed || server.signaling !== this) {
+      throw new RPC.Error('PEER_CONNECTION_FAILED')
+    }
+
+    incoming = { server, remotePublicKey: req.body.remotePublicKey, promise: null }
+
+    this._incoming.set(token, incoming)
+
+    incoming.promise = Promise.resolve().then(() => this._acceptPeer(req, incoming))
+    incoming.promise.catch(() => {})
+
+    return incoming.promise
+  }
+
+  async _acceptPeer (req, incoming) {
+    const token = req.body.token
+    const server = incoming.server
+
+    try {
+      if (!(await server._firewall(incoming.remotePublicKey))) {
+        throw new RPC.Error('PEER_CONNECTION_FAILED')
+      }
+
+      if (this.closed || this.rtc.closing || this.rtc.closed || server.closed || server.signaling !== this || this._incoming.get(token) !== incoming) {
+        throw new RPC.Error('PEER_CONNECTION_FAILED')
+      }
+
+      return server._createIncomingPeer(req)
+    } finally {
+      if (this._incoming.get(token) === incoming) {
+        this._incoming.delete(token)
+      }
+    }
+  }
+
+  _clearIncoming (server) {
+    for (const [token, incoming] of this._incoming) {
+      if (server && incoming.server !== server) {
+        continue
+      }
+
+      this._incoming.delete(token)
+    }
+  }
+
+  async _onConnect (req) {
+    const peer = await this._getOrCreatePeer(req)
+
+    if (peer.closed || peer.closing) {
+      throw new RPC.Error('PEER_CONNECTION_FAILED')
+    }
+  }
+
+  async _onNegotiation (req) {
+    const peer = await this._getOrCreatePeer(req)
+
+    return this.rtc._negotiation(peer, req)
+  }
+
+  async _onIce (req) {
+    const peer = await this._getOrCreatePeer(req)
+
+    return this.rtc._ice(peer, req)
   }
 
   _onAck (req) {
-    if (this.closed || this.rtc.closing || this.rtc.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
+    const peer = this._getPeer(req)
 
-    return this._ack(req)
+    return this.rtc._ack(peer, req)
   }
 }
 
