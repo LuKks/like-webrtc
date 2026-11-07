@@ -1,9 +1,8 @@
 const { RTCPeerConnection, RTCIceCandidate } = require('webrtc-runtime')
 const b4a = require('b4a')
-const RPC = require('./lib/rpc.js')
 const Signaling = require('./signaling.js')
-
 const Peer = require('./lib/peer.js')
+const PeerSession = require('./lib/peer-session.js')
 const crypto = require('hypercore-crypto')
 const bs58 = maybeDefaultModule(require('bs58'))
 
@@ -13,6 +12,14 @@ const SocketDuplex = require('./duplex/socket.js')
 
 const Server = require('./server.js')
 const Client = require('./client.js')
+
+const ICE_SERVERS = [
+  { urls: 'stun:turn.leet.ar:3478' },
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'turn:turn.leet.ar:3478?transport=udp', username: 'us3rn4m3', credential: 'p4$$w0rd' },
+  { urls: 'turn:turn.leet.ar:3478?transport=tcp', username: 'us3rn4m3', credential: 'p4$$w0rd' }
+]
 
 module.exports = class WebRTC {
   static Peer = Peer
@@ -40,9 +47,8 @@ module.exports = class WebRTC {
 
     this.signaling = opts.signaling || 'wss://party.leet.ar:41337'
 
-    // Defaults in lib/peer.js
-    this.iceServers = opts.iceServers || null
-    this.iceTransportPolicy = opts.iceTransportPolicy || null
+    this.iceServers = opts.iceServers || ICE_SERVERS
+    this.iceTransportPolicy = opts.iceTransportPolicy || 'all'
 
     this.trickle = opts.trickle !== false
 
@@ -270,13 +276,6 @@ module.exports = class WebRTC {
     const keyPair = signaling.keyPair || this.keyPair
 
     const peer = new Peer({
-      signaling,
-      token,
-
-      isInitiator,
-
-      publicKey: keyPair.publicKey,
-      remotePublicKey,
       polite: isPolitePeer(keyPair.publicKey, remotePublicKey),
 
       RTCPeerConnection: this.RTCPeerConnection,
@@ -288,65 +287,32 @@ module.exports = class WebRTC {
       trickle: this.trickle,
       debug: this.debug
     })
+    const session = new PeerSession(signaling, peer, { token, isInitiator, remotePublicKey })
 
     peer.connection.address = bs58.encode(keyPair.publicKey)
     peer.connection.publicKey = keyPair.publicKey
+    peer.connection.remotePublicKey = remotePublicKey
+    peer.connection.isInitiator = isInitiator
+
+    peer.on('error', err => {
+      if (this.debug) console.error(err)
+    })
 
     peer.once('close', () => {
-      if (this.peers.get(token) === peer) {
+      if (this.peers.get(token) === session) {
         this.peers.delete(token)
 
-        signaling._release(peer).catch(err => {
+        signaling._release(session).catch(err => {
           if (this.debug) console.error(err)
         })
       }
     })
 
-    this.peers.set(token, peer)
+    this.peers.set(token, session)
 
-    signaling._retain(peer)
+    signaling._retain(session)
 
     return peer
-  }
-
-  async _negotiation (peer, req) {
-    if (this.closing || this.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    if (!peer || peer.closed || peer.closing) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    await peer.handleDescription(req.body.description, req.body.messageId)
-
-    peer.sendAck(req.body.messageId)
-  }
-
-  async _ice (peer, req) {
-    if (this.closing || this.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    if (!peer || peer.closed || peer.closing) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    await peer.handleCandidate(req.body.candidate, req.body.messageId)
-
-    peer.sendAck(req.body.messageId)
-  }
-
-  async _ack (peer, req) {
-    if (this.closing || this.closed) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    if (!peer || peer.closed || peer.closing) {
-      throw new RPC.Error('PEER_CONNECTION_FAILED')
-    }
-
-    peer.handleAck(req.body.ack)
   }
 }
 

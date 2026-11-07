@@ -10,6 +10,7 @@ const b4a = require('b4a')
 
 const RPC = require('./lib/rpc.js')
 const Peer = require('./lib/peer.js')
+const PeerSession = require('./lib/peer-session.js')
 
 const PartyServer = require('./lib/party.js')
 const RTC = require('./index.js')
@@ -271,15 +272,14 @@ test('echo round trip - new channel after ICE restart', { timeout: 90000 }, asyn
 
   await echoRoundTrip(t, peer, 'after-ice-restart', 'hello after ice restart')
 
-  const internalPeer = getOnlyInternalPeer(b)
-  const before = internalPeer.iceRestartCompleted
+  const before = peer.localDescription.sdp
 
-  internalPeer.restartIce('test forced ICE restart')
+  peer.restartIce()
 
   await echoRoundTrip(t, peer, 'after-ice-restart', 'hello after ice restart')
 
   await waitForCondition(() => {
-    return internalPeer.iceRestartCompleted > before
+    return peer.localDescription.sdp !== before && peer.signalingState === 'stable'
   }, 30000, 'ICE restart negotiation completed')
 
   await echoRoundTrip(t, peer, 'after-ice-restart', 'hello after ice restart')
@@ -302,14 +302,14 @@ test('echo round trip - new channel after ICE restart', { timeout: 90000 }, asyn
 test('ICE repair ignores failed ICE while aggregate connection is connected', function (t) {
   const peer = Object.create(Peer.prototype)
 
-  peer.pc = {
+  peer.connection = {
     connectionState: 'connected',
     iceConnectionState: 'failed'
   }
 
   t.is(peer._iceNeedsRepair(), false, 'connected aggregate state is healthy')
 
-  peer.pc = {
+  peer.connection = {
     connectionState: 'connecting',
     iceConnectionState: 'failed'
   }
@@ -327,8 +327,12 @@ test('first data channel negotiation is coalesced', { timeout: 90000 }, async fu
 
   const a = new RTC({ signaling })
   const b = new RTC({ signaling })
+  const sent = [[], []]
 
   const server = a.createServer(peer => {
+    getOnlyInternalPeer(a).on('signal', data => {
+      if (data.description) sent[0].push(data.description)
+    })
     peer.ondatachannel = e => {
       echoDataChannel(e.channel)
     }
@@ -337,6 +341,10 @@ test('first data channel negotiation is coalesced', { timeout: 90000 }, async fu
   await server.listen()
 
   const peer = b.connect(server.publicKey)
+
+  getOnlyInternalPeer(b).on('signal', data => {
+    if (data.description) sent[1].push(data.description)
+  })
 
   await echoRoundTrip(t, peer, 'first', 'hello')
 
@@ -350,20 +358,20 @@ test('first data channel negotiation is coalesced', { timeout: 90000 }, async fu
   await waitForCondition(() => {
     return (
       peer.signalingState === 'stable' &&
-      serverPeer.pc.signalingState === 'stable' &&
-      clientPeer.pc.signalingState === 'stable' &&
+      serverPeer.connection.signalingState === 'stable' &&
+      clientPeer.connection.signalingState === 'stable' &&
       isPeerConnected(peer)
     )
   }, 30000, 'stable after first data channel')
 
   await delay(500)
 
-  t.is(clientPeer.localOfferSeq, 1, 'client sent one offer')
-  t.is(clientPeer.remoteAnswerSeq, 1, 'client accepted one answer')
-  t.is(serverPeer.localOfferSeq, 0, 'server did not create a follow-up offer')
-  t.ok(serverPeer.remoteOfferSeq >= 1, 'server accepted the client offer')
-  t.is(clientPeer.needsNegotiation, false, 'client has no pending negotiation')
-  t.is(serverPeer.needsNegotiation, false, 'server has no pending negotiation')
+  t.is(sent[1].filter(description => description.type === 'offer').length, 1, 'client sent one offer')
+  t.is(sent[0].filter(description => description.type === 'answer').length, 1, 'server sent one answer')
+  t.is(sent[0].filter(description => description.type === 'offer').length, 0, 'server did not create a follow-up offer')
+  t.is(serverPeer.connection.remoteDescription.sdp.match(/^o=.+$/m)[0], sent[1][0].sdp.match(/^o=.+$/m)[0], 'server accepted the client offer')
+  t.is(clientPeer.connection.remoteDescription.sdp.match(/^o=.+$/m)[0], sent[0][0].sdp.match(/^o=.+$/m)[0], 'client accepted the server answer')
+  t.is(sent[1].length, 1, 'client did not send a follow-up description')
 
   await server.close()
   await a.close()
@@ -371,7 +379,7 @@ test('first data channel negotiation is coalesced', { timeout: 90000 }, async fu
   await party.close()
 })
 
-test('negotiated channels survive signaling reconnect and renegotiation', { timeout: 30000 }, async function (t) {
+test('negotiated channels survive signaling reconnect and renegotiation', async function (t) {
   t.plan(3)
 
   const party = new PartyServer()
@@ -453,7 +461,41 @@ test('negotiated channels survive signaling reconnect and renegotiation', { time
   t.is((await after).toString(), 'after reconnect', 'existing channel still delivers messages')
 })
 
-test('receiver can start with only a data channel or media', { timeout: 30000 }, async function (t) {
+test('ICE restart resumes when only the remote signaling reconnects', async function (t) {
+  t.plan(2)
+
+  const pair = createNegotiationPair(t, true)
+  const [a, b] = pair.peers
+  const channels = pair.peers.map(peer => peer.connection.createDataChannel('chat', { negotiated: true, id: 1 }))
+
+  pair.open()
+
+  await waitForCondition(() => {
+    return channels.every(channel => channel.readyState === 'open') &&
+      pair.peers.every(peer => peer.connection.signalingState === 'stable') &&
+      pair.sessions.every(session => session._pending.size === 0)
+  }, 5000, 'initial connection settles')
+
+  const before = b.connection.remoteDescription.sdp
+
+  pair.online = false
+  a.connection.restartIce()
+
+  await waitForCondition(() => a.connection.signalingState === 'have-local-offer', 5000, 'queued ICE restart offer')
+
+  t.is(a.connection.signalingState, 'have-local-offer', 'ICE restart waits for the offline peer')
+
+  pair.online = true
+  pair.signalings[1].emit('online')
+
+  await t.execution(waitForCondition(() => {
+    return b.connection.remoteDescription.sdp !== before &&
+      pair.peers.every(peer => peer.connection.signalingState === 'stable') &&
+      pair.sessions.every(session => session._pending.size === 0)
+  }, 5000, 'ICE restart after remote-only signaling reconnect'), 'the queued ICE restart resumes after the remote reconnects')
+})
+
+test('receiver can start with only a data channel or media', async function (t) {
   t.plan(3)
 
   for (const media of [false, true]) {
@@ -509,15 +551,15 @@ test('receiver can start with only a data channel or media', { timeout: 30000 },
   }
 })
 
-test('simultaneous first offers recover with either polite peer', { timeout: 30000 }, async function (t) {
+test('simultaneous first offers recover with either polite peer', async function (t) {
   t.plan(10)
 
   for (const polite of [false, true]) {
     for (const media of [false, true]) {
       const pair = createNegotiationPair(t, polite)
-      const channels = pair.peers.map(peer => peer.createDataChannel('chat', { negotiated: true, id: 1 }))
+      const channels = pair.peers.map(peer => peer.connection.createDataChannel('chat', { negotiated: true, id: 1 }))
       const transceivers = media
-        ? pair.peers.map(peer => peer.addTransceiver('audio', { direction: 'recvonly' }))
+        ? pair.peers.map(peer => peer.connection.addTransceiver('audio', { direction: 'recvonly' }))
         : []
 
       await waitForCondition(() => {
@@ -553,12 +595,12 @@ test('simultaneous first offers recover with either polite peer', { timeout: 300
   }
 })
 
-test('ICE received during glare survives signaling reconnect before the answer', { timeout: 30000 }, async function (t) {
+test('ICE received during glare survives signaling reconnect before the answer', async function (t) {
   t.plan(3)
 
   const pair = createNegotiationPair(t, true)
   const [polite, impolite] = pair.peers
-  const channels = pair.peers.map(peer => peer.createDataChannel('chat', { negotiated: true, id: 1 }))
+  const channels = pair.peers.map(peer => peer.connection.createDataChannel('chat', { negotiated: true, id: 1 }))
 
   pair.hold = message => message.body.description?.type === 'answer' || message.name === 'webrtc-ack'
 
@@ -577,7 +619,7 @@ test('ICE received during glare survives signaling reconnect before the answer',
   const ufrag = answer.body.description.sdp.match(/^a=ice-ufrag:(.+)$/m)[1].trim()
 
   // Observe the queue here so the test cannot pass solely through peer-reflexive ICE.
-  await waitForCondition(() => impolite.pendingCandidates.some(candidate => candidate?.usernameFragment === ufrag), 5000, 'answer candidates before the answer')
+  await waitForCondition(() => impolite._candidates.some(candidate => candidate?.usernameFragment === ufrag), 5000, 'answer candidates before the answer')
 
   t.is(impolite.connection.remoteDescription, null, 'ICE arrives before the held answer')
 
@@ -597,7 +639,7 @@ test('ICE received during glare survives signaling reconnect before the answer',
   t.alike(pair.peers.map(peer => peer.connection.signalingState), ['stable', 'stable'], 'both peers settle after reconnect')
 })
 
-test('closing a listener preserves independent outgoing peers', { timeout: 30000 }, async function (t) {
+test('closing a listener preserves independent outgoing peers', async function (t) {
   t.plan(5)
 
   const party = new PartyServer()
@@ -639,7 +681,7 @@ test('closing a listener preserves independent outgoing peers', { timeout: 30000
   await echoRoundTrip(t, next, 'later-client', 'new connections still work')
 })
 
-test('closing clients for another identity releases idle signaling sockets', { timeout: 30000 }, async function (t) {
+test('closing clients for another identity releases idle signaling sockets', async function (t) {
   t.plan(7)
 
   const party = new PartyServer()
@@ -709,7 +751,7 @@ test('closing clients for another identity releases idle signaling sockets', { t
   t.is(sockets.size, 0, 'closing the final owner releases all its sockets')
 })
 
-test('closing a client before signaling opens releases its socket', { timeout: 30000 }, async function (t) {
+test('closing a client before signaling opens releases its socket', async function (t) {
   t.plan(2)
 
   const sockets = new Set()
@@ -740,7 +782,7 @@ test('closing a client before signaling opens releases its socket', { timeout: 3
   t.is(sockets.size, 0, 'pending signaling leaves no open socket')
 })
 
-test('concurrent connections and discovery keep working', { timeout: 30000 }, async function (t) {
+test('concurrent connections and discovery keep working', async function (t) {
   t.plan(7)
 
   const party = new PartyServer()
@@ -795,7 +837,7 @@ test('concurrent connections and discovery keep working', { timeout: 30000 }, as
   t.alike(remaining.map(peer => b4a.toString(peer.publicKey, 'hex')), [b4a.toString(server.publicKey, 'hex')], 'closing one listener leaves the other publication')
 })
 
-test('a replacement listener accepts new peers while the previous server drains', { timeout: 30000 }, async function (t) {
+test('a replacement listener accepts new peers while the previous server drains', async function (t) {
   t.plan(12)
 
   const party = new PartyServer()
@@ -866,7 +908,7 @@ test('a replacement listener accepts new peers while the previous server drains'
   t.is((await b.lookup(topic)).length, 0, 'replacement withdraws its topic on close')
 })
 
-test('pending connections keep their original server and firewall after handoff', { timeout: 30000 }, async function (t) {
+test('pending connections keep their original server and firewall after handoff', async function (t) {
   t.plan(10)
 
   for (const allowed of [true, false]) {
@@ -961,7 +1003,7 @@ test('pending connections keep their original server and firewall after handoff'
   }
 })
 
-test('listener key changes preserve existing peers', { timeout: 30000 }, async function (t) {
+test('listener key changes preserve existing peers', async function (t) {
   t.plan(6)
 
   const party = new PartyServer()
@@ -1578,7 +1620,7 @@ function getOnlyInternalPeer (rtc) {
     throw new Error('Expected exactly one internal peer, got ' + peers.length)
   }
 
-  return peers[0]
+  return peers[0].peer
 }
 
 function isPeerConnected (peer) {
@@ -2254,7 +2296,7 @@ function streamPair () {
 }
 
 function createNegotiationPair (t, polite) {
-  const pair = { peers: [], signalings: [], messages: [], hold: null, online: false }
+  const pair = { peers: [], sessions: [], signalings: [], messages: [], hold: null, online: false }
 
   for (let i = 0; i < 2; i++) {
     const signaling = new EventEmitter()
@@ -2266,13 +2308,15 @@ function createNegotiationPair (t, polite) {
 
       if (!pair.online || pair.hold?.(message)) return false
 
-      queueMicrotask(() => pair.peers[1 - i].signal({ name, body }))
+      queueMicrotask(() => pair.sessions[1 - i].signal(name, body).catch(err => t.fail(err.message)))
 
       return true
     }
 
     pair.signalings.push(signaling)
-    pair.peers.push(new RTC.Peer({ signaling, polite: i === 0 ? polite : !polite, isInitiator: i === 1, iceServers: [] }))
+    const peer = new RTC.Peer({ polite: i === 0 ? polite : !polite, iceServers: [] })
+    pair.peers.push(peer)
+    pair.sessions.push(new PeerSession(signaling, peer, { token: 'test', isInitiator: i === 1 }))
   }
 
   pair.open = function () {
@@ -2284,4 +2328,307 @@ function createNegotiationPair (t, polite) {
   t.teardown(() => Promise.all(pair.peers.map(peer => peer.close())))
 
   return pair
+}
+
+test('standalone peers use manual signaling with either ICE gathering mode', async function (t) {
+  t.plan(24)
+
+  for (const trickle of [true, false]) {
+    for (const remoteTrickle of [true, false]) {
+      const a = new Peer({ polite: false, trickle })
+      const b = new Peer({ polite: true, trickle: remoteTrickle })
+      const signals = []
+
+      t.teardown(() => Promise.all([a.close(), b.close()]))
+
+      a.on('error', err => t.fail(err.message))
+      b.on('error', err => t.fail(err.message))
+      a.on('signal', data => {
+        signals.push(data)
+        b.signal(data)
+      })
+      b.on('signal', data => a.signal(data))
+      b.connection.ondatachannel = event => echoDataChannel(event.channel)
+
+      t.alike(a.connection.getConfiguration().iceServers, [], 'standalone peers have no preset ICE servers')
+
+      await echoRoundTrip(t, a.connection, 'first', 'first message')
+      await echoRoundTrip(t, a.connection, 'later', 'later message')
+
+      t.is(signals.filter(data => data.description?.type === 'offer').length, 1, 'later channels do not renegotiate SCTP')
+      t.is(signals.some(data => 'candidate' in data), trickle, 'candidate events follow the local trickle option')
+
+      const before = a.connection.localDescription.sdp.match(/^a=ice-ufrag:(.+)$/m)[1]
+
+      a.connection.restartIce()
+      await waitForCondition(() => {
+        return a.connection.signalingState === 'stable' && b.connection.signalingState === 'stable' &&
+          a.connection.localDescription.sdp.match(/^a=ice-ufrag:(.+)$/m)[1] !== before
+      }, 5000, 'standalone ICE restart')
+
+      await echoRoundTrip(t, a.connection, 'restarted', 'message after restart')
+      await Promise.all([a.close(), b.close()])
+    }
+  }
+})
+
+test('standalone peers negotiate media added and removed through the native connection', { timeout: 10000 }, async function (t) {
+  t.plan(3)
+
+  const { nonstandard } = require('webrtc-runtime')
+  const a = new Peer({ polite: false })
+  const b = new Peer({ polite: true })
+  const source = new nonstandard.RTCAudioSource()
+  const track = source.createTrack()
+  const received = []
+
+  t.teardown(async () => {
+    track.stop()
+    await Promise.all([a.close(), b.close()])
+  })
+
+  a.on('error', err => t.fail(err.message))
+  b.on('error', err => t.fail(err.message))
+  a.on('signal', data => b.signal(data))
+  b.on('signal', data => a.signal(data))
+  b.connection.ondatachannel = event => echoDataChannel(event.channel)
+  b.connection.ontrack = event => received.push(event.track)
+
+  await echoRoundTrip(t, a.connection, 'bootstrap', 'connected')
+
+  const sender = a.connection.addTrack(track)
+
+  await waitForCondition(() => received.length === 1 && a.connection.signalingState === 'stable', 5000, 'added audio track')
+
+  t.is(received[0].kind, 'audio', 'audio is negotiated after the data connection')
+
+  a.connection.removeTrack(sender)
+
+  await waitForCondition(() => {
+    return b.connection.getTransceivers()[0]?.currentDirection === 'inactive' &&
+      a.connection.signalingState === 'stable'
+  }, 5000, 'removed audio track')
+
+  t.is(a.connection.getSenders().filter(sender => sender.track).length, 0, 'native removeTrack renegotiates')
+})
+
+test('standalone close cancels an offer and non-trickle gathering', async function (t) {
+  t.plan(16)
+
+  for (const gathering of [false, true]) {
+    const pc = createPeerConnection()
+    const rawClose = pc.close.bind(pc)
+    let closes = 0
+    let closeEvents = 0
+    let finishOffer
+
+    pc.close = () => {
+      closes++
+      rawClose()
+    }
+
+    if (!gathering) {
+      pc.createOffer = () => new Promise(resolve => { finishOffer = resolve })
+    }
+
+    const peer = new Peer({
+      RTCPeerConnection: function () { return pc },
+      trickle: false,
+      connectTimeout: 0
+    })
+    const signals = []
+
+    peer.on('signal', data => signals.push(data))
+    peer.on('close', () => {
+      closeEvents++
+      peer.close()
+    })
+    pc.emit('negotiationneeded')
+
+    await waitForCondition(() => gathering ? pc.iceGatheringState === 'gathering' : !!finishOffer, 1000, 'pending local description')
+
+    const closing = peer.connection.close()
+
+    peer.close()
+
+    t.is(closing, undefined, 'close is synchronous')
+    t.is(peer.closed, true, 'peer is closed immediately')
+    t.is(peer.closing, true, 'closing remains true')
+    t.is(closes, 1, 'native close runs once through both APIs')
+    t.is(closeEvents, 1, 'close emits once synchronously, including reentrant close')
+
+    if (finishOffer) finishOffer({ type: 'offer', sdp: 'a=ice-ufrag:local\r\n' })
+    await peer._operations
+
+    t.is(signals.length, 0, 'closing suppresses the pending signal')
+    t.is(pc.eventNames().length, 0, 'native listeners are removed')
+
+    const error = new Promise(resolve => peer.once('error', resolve))
+
+    peer.signal({ candidate: null })
+
+    t.is((await error).code, 'PEER_CLOSED', 'signal after close emits an error')
+  }
+})
+
+test('standalone connection deadlines begin with negotiation and bound recovery', async function (t) {
+  t.plan(5)
+
+  const pc = createPeerConnection()
+  const peer = new Peer({
+    RTCPeerConnection: function () { return pc },
+    connectTimeout: 20,
+    disconnectTimeout: 20,
+    iceDisconnectedRestartDelay: 1
+  })
+  const errors = []
+
+  t.teardown(() => peer.close())
+  peer.on('error', err => errors.push(err.code))
+
+  await delay(40)
+
+  t.is(peer.closed, false, 'an unused peer has no connection deadline')
+
+  pc.emit('negotiationneeded')
+  await waitForCondition(() => peer.closed, 1000, 'connection deadline')
+
+  t.alike(errors, ['PEER_CONNECT_TIMEOUT'], 'an unanswered negotiation times out once')
+
+  const recovering = createPeerConnection()
+  const remote = new Peer({
+    RTCPeerConnection: function () { return recovering },
+    disconnectTimeout: 20,
+    iceDisconnectedRestartDelay: 1
+  })
+
+  t.teardown(() => remote.close())
+  recovering.connectionState = 'connected'
+  recovering.iceConnectionState = 'connected'
+  recovering.emit('connectionstatechange')
+  recovering.connectionState = 'disconnected'
+  recovering.iceConnectionState = 'disconnected'
+  recovering.emit('connectionstatechange')
+  recovering.emit('iceconnectionstatechange')
+
+  await waitForCondition(() => recovering.localDescription, 1000, 'automatic ICE restart')
+
+  t.ok(recovering.localDescription, 'disconnection starts a repair negotiation')
+
+  await waitForCondition(() => remote.closed, 1000, 'recovery deadline')
+
+  t.is(remote.closed, true, 'an unsuccessful recovery has a deadline')
+  t.is(recovering.eventNames().length, 0, 'recovery shutdown removes its listeners')
+})
+
+test('future ICE candidates survive reordering and retired candidates are ignored', async function (t) {
+  t.plan(6)
+
+  const pc = createPeerConnection()
+  const peer = new Peer({
+    RTCPeerConnection: function () { return pc },
+    RTCIceCandidate: function (candidate) { return candidate }
+  })
+  const old = { candidate: 'candidate:1 1 udp 1 127.0.0.1 10000 typ host', usernameFragment: 'old' }
+  const next = { ...old, usernameFragment: 'next' }
+  const errors = []
+
+  t.teardown(() => peer.close())
+  peer.on('error', err => errors.push(err))
+
+  await peer._signal({ description: { type: 'offer', sdp: 'a=ice-ufrag:old\r\n' } })
+  await peer._signal({ candidate: next })
+
+  t.is(pc.candidates.length, 0, 'future candidates wait for their description')
+
+  await peer._signal({ description: { type: 'offer', sdp: 'a=ice-ufrag:next\r\n' } })
+
+  t.alike(pc.candidates, [next], 'the new description applies its early candidate')
+
+  await peer._signal({ candidate: old })
+
+  t.is(pc.candidates.length, 1, 'retired candidates are not applied to the new generation')
+
+  const failure = new Error('Candidate failed')
+  pc.addIceCandidate = async () => { throw failure }
+
+  t.is(peer.signal({ candidate: next }), undefined, 'signal returns synchronously without a promise')
+
+  await waitForCondition(() => errors.length === 1, 1000, 'candidate error')
+
+  t.is(errors[0], failure, 'native errors are emitted')
+
+  peer.signal({ description: null })
+  await waitForCondition(() => errors.length === 2, 1000, 'invalid signal error')
+
+  t.is(errors[1].code, 'INVALID_SIGNAL', 'invalid signals emit an error')
+})
+
+test('a media offer ignored during glare is replayed after the delayed answer', async function (t) {
+  t.plan(3)
+
+  const pair = createNegotiationPair(t, true)
+  const channels = pair.peers.map(peer => peer.connection.createDataChannel('chat', { negotiated: true, id: 1 }))
+  const transceivers = pair.peers.map(peer => peer.connection.addTransceiver('audio', { direction: 'recvonly' }))
+
+  pair.hold = message => message.body.description?.type === 'answer'
+
+  await waitForCondition(() => pair.messages.filter(message => message.body.description?.type === 'offer').length === 2, 5000, 'first offers')
+
+  pair.open()
+
+  await waitForCondition(() => {
+    return pair.messages.filter(message => message.from === 0 && message.body.description?.type === 'offer').length >= 2
+  }, 5000, 'follow-up media offer before the answer')
+
+  pair.hold = null
+  pair.open()
+
+  await waitForCondition(() => {
+    return pair.peers.every(peer => peer.connection.signalingState === 'stable') &&
+      transceivers.every(transceiver => transceiver.mid !== null) &&
+      channels.every(channel => channel.readyState === 'open')
+  }, 5000, 'replayed media offer')
+
+  t.ok(transceivers.every(transceiver => transceiver.mid !== null && !transceiver.stopped), 'both local media requests survive')
+  t.alike(pair.peers.map(peer => peer.connection.signalingState), ['stable', 'stable'], 'both peers settle')
+
+  const received = new Promise(resolve => { channels[1].onmessage = event => resolve(event.data) })
+
+  channels[0].send('after glare')
+
+  t.is(await received, 'after glare', 'the data connection survives replay')
+})
+
+function createPeerConnection () {
+  const pc = new EventEmitter()
+
+  pc.signalingState = 'stable'
+  pc.connectionState = 'new'
+  pc.iceConnectionState = 'new'
+  pc.iceGatheringState = 'new'
+  pc.localDescription = null
+  pc.remoteDescription = null
+  pc.candidates = []
+  pc.addEventListener = pc.on
+  pc.removeEventListener = pc.removeListener
+  pc.createOffer = async () => ({ type: 'offer', sdp: 'a=ice-ufrag:local\r\n' })
+  pc.createAnswer = async () => ({ type: 'answer', sdp: 'a=ice-ufrag:local\r\n' })
+  pc.setLocalDescription = async description => {
+    pc.localDescription = description
+    pc.signalingState = description.type === 'offer' ? 'have-local-offer' : 'stable'
+    pc.iceGatheringState = 'gathering'
+  }
+  pc.setRemoteDescription = async description => {
+    pc.remoteDescription = description
+    pc.signalingState = description.type === 'offer' ? 'have-remote-offer' : 'stable'
+  }
+  pc.addIceCandidate = async candidate => { pc.candidates.push(candidate) }
+  pc.close = () => {
+    pc.signalingState = 'closed'
+    pc.connectionState = 'closed'
+    pc.iceConnectionState = 'closed'
+  }
+
+  return pc
 }

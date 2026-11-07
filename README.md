@@ -34,7 +34,9 @@ const server = rtc.createServer(peer => {
   channel.addEventListener('message', e => console.log('Server received:', e.data))
 })
 
-await server.listen()
+const keyPair = RTC.keyPair()
+
+await server.listen(keyPair)
 ```
 
 ```js
@@ -154,14 +156,6 @@ Options:
 }
 ```
 
-#### `rtc.publicKey`
-
-Returns the RTC instance's public key as a buffer.
-
-#### `rtc.address`
-
-Returns the RTC instance's public key as a Base58 string.
-
 ### `peer = rtc.connect(publicKey[, options])`
 
 Creates a P2P connection and returns a `RTCPeerConnection`.
@@ -175,6 +169,22 @@ Options:
   keyPair // Defaults to rtc.keyPair.
 }
 ```
+
+#### `peer.isInitiator`
+
+Identifies the client (`true`) or server (`false`) side.
+
+#### `peer.publicKey`
+
+The local public key used for this connection as a buffer.
+
+#### `peer.address`
+
+The local public key used for this connection as a Base58 string.
+
+#### `peer.remotePublicKey`
+
+The remote peer's public key as a buffer.
 
 ### `server = rtc.createServer([options][, handler])`
 
@@ -333,10 +343,6 @@ Discord forwards WebRTC media with SFUs so peers don't connect together.
 - WebRTC-HTTP egress protocol (WHEP instead of HLS/CDN?)
 - Reusable module for WebRTC audio, video, screen, etc so that creating frontend apps is easy
 - HTTPS server that helps connect to a WebRTC signaling peer to avoid TCP/HTTPS/WebSocket traffic
-
-## Notes
-
-This was a one-week kind of thing. I built it while using two React Native instances and it worked but I was having issues with ICE restarts, negotiations, opening channels on demand, etc. At that point, I had everything written by hand but due those issues I ended up trying AI to enhance the code (especially the Peer class). Later on, I ran the code in Node.js and the browser, and I realized a bit too late that the original issues were only present in React Native due old unstable WebRTC builds. So most of the AI code i.e. changes in lib/peer.js are probably mostly unnecessary and could be simplified, but I didn't want to revert the changes due several added features. Summary: Peer needs a rewrite to get back to simplicity.
 
 ## License
 

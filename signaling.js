@@ -67,8 +67,8 @@ module.exports = class Signaling extends EventEmitter {
     })
 
     this.rpc.respond('webrtc-connect', this._onConnect.bind(this))
-    this.rpc.respond('webrtc-negotiation', this._onNegotiation.bind(this))
-    this.rpc.respond('webrtc-ice', this._onIce.bind(this))
+    this.rpc.respond('webrtc-negotiation', this._onSignal.bind(this, 'webrtc-negotiation'))
+    this.rpc.respond('webrtc-ice', this._onSignal.bind(this, 'webrtc-ice'))
     this.rpc.respond('webrtc-ack', this._onAck.bind(this))
 
     this.rpc.stream.on('open', () => {
@@ -300,7 +300,9 @@ module.exports = class Signaling extends EventEmitter {
         throw new RPC.Error('PEER_CONNECTION_FAILED')
       }
 
-      return server._createIncomingPeer(req)
+      server._createIncomingPeer(req)
+
+      return this.rtc.peers.get(token)
     } finally {
       if (this._incoming.get(token) === incoming) {
         this._incoming.delete(token)
@@ -326,22 +328,24 @@ module.exports = class Signaling extends EventEmitter {
     }
   }
 
-  async _onNegotiation (req) {
+  async _onSignal (name, req) {
     const peer = await this._getOrCreatePeer(req)
 
-    return this.rtc._negotiation(peer, req)
-  }
+    if (this.closed || this.rtc.closing || this.rtc.closed || !peer || peer.closed || peer.closing) {
+      throw new RPC.Error('PEER_CONNECTION_FAILED')
+    }
 
-  async _onIce (req) {
-    const peer = await this._getOrCreatePeer(req)
-
-    return this.rtc._ice(peer, req)
+    return peer.signal(name, req.body)
   }
 
   _onAck (req) {
     const peer = this._getPeer(req)
 
-    return this.rtc._ack(peer, req)
+    if (!peer || peer.closed || peer.closing) {
+      throw new RPC.Error('PEER_CONNECTION_FAILED')
+    }
+
+    return peer.signal('webrtc-ack', req.body)
   }
 }
 
