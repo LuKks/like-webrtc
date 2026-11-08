@@ -1680,7 +1680,7 @@ function waitEvent (emitter, name, timeout, label) {
     }
 
     emitter.once(name, onevent)
-    emitter.once('error', onerror)
+    if (name !== 'error') emitter.once('error', onerror)
   })
 }
 
@@ -2519,6 +2519,32 @@ test('standalone connection deadlines begin with negotiation and bound recovery'
 
   t.is(remote.closed, true, 'an unsuccessful recovery has a deadline')
   t.is(recovering.eventNames().length, 0, 'recovery shutdown removes its listeners')
+})
+
+test('standalone connection deadline covers DTLS setup', async function (t) {
+  t.plan(2)
+
+  const pc = createPeerConnection()
+  const peer = new Peer({
+    RTCPeerConnection: function () { return pc },
+    connectTimeout: 5000
+  })
+
+  t.teardown(() => peer.close())
+
+  const answer = waitEvent(peer, 'signal', 5000, 'local answer')
+  peer.signal({ description: { type: 'offer', sdp: 'a=ice-ufrag:remote\r\n' } })
+  await answer
+
+  const failed = waitEvent(peer, 'error', 10000, 'peer timeout error')
+  pc.connectionState = 'connecting'
+  pc.iceConnectionState = 'connected'
+  pc.emit('iceconnectionstatechange')
+
+  const error = await failed
+
+  t.is(error.code, 'PEER_CONNECT_TIMEOUT', 'stalled DTLS emits a connection timeout')
+  t.is(peer.closed, true, 'the timed-out peer closes')
 })
 
 test('future ICE candidates survive reordering and retired candidates are ignored', async function (t) {
