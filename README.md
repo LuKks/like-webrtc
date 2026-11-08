@@ -1,14 +1,25 @@
 # like-webrtc
 
-Peer-to-peer WebRTC connections with built-in signaling.
+Peer-to-peer WebRTC connections with built-in signaling and peer discovery.
 
 Works across browsers, Node.js, and React Native.
+
+[![npm](https://img.shields.io/npm/v/like-webrtc.svg)](https://www.npmjs.com/package/like-webrtc)
+[![downloads](https://img.shields.io/npm/dt/like-webrtc.svg)](https://www.npmjs.com/package/like-webrtc)
+[![license](https://img.shields.io/github/license/LuKks/like-webrtc.svg)](https://github.com/LuKks/like-webrtc/blob/main/LICENSE)
+[![CI](https://github.com/LuKks/like-webrtc/actions/workflows/test-node.yml/badge.svg?branch=main)](https://github.com/LuKks/like-webrtc/actions/workflows/test-node.yml)
 
 ```
 npm i like-webrtc
 ```
 
-Warning: this is experimental.
+- **P2P servers.** Listen for peer connections anywhere, even in the browser.
+- **Direct connections.** Connect to peers across devices and networks.
+- **Built-in signaling.** Automatic SDP/ICE exchange and negotiation.
+- **Identities.** Shareable cryptographic addresses instead of IP addresses.
+- **Peer discovery.** Announce and find peers using shared topics.
+- **WebRTC API.** Use data channels, audio/video tracks and transceivers.
+- **Ready to use.** Signaling, STUN and TURN configured by default.
 
 Live demo: https://web.leet.ar (P2P Discord clone built in 48 hours)
 
